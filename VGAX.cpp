@@ -1,103 +1,247 @@
-/*
-VGAX_RGB3.cpp - 3-bit RGB VGA video output for Arduino UNO
-Modified from the original VGAX library by Sandro Maffiodo
-*/
-
 #include "VGAX_RGB3.h"
 #include <avr/interrupt.h>
 
-// 3-bit RGB framebuffer: 1 byte per pixel (lower 3 bits used)
-byte vgaxfb[VGAX_SIZE];
+volatile uint8_t vgaxfb[VGAX_BSIZE];
+volatile unsigned long vtimer = 0;
 
-// Virtual timer (increments once per frame, ~60Hz)
-unsigned long vtimer = 0;
+static volatile uint8_t tone_pin_mask = 0;
+static volatile uint16_t tone_divider = 0;
 
-void VGAX::begin(bool enableTone) {
-  // Set VGA sync and color pins as output
-  // Adjust as needed for your resistor DAC setup
-  DDRD |= _BV(6) | _BV(5) | _BV(3); // PD6=R, PD5=G, PD3=B
-  DDRD |= _BV(7); // PD7 = HSYNC
-  DDRB |= _BV(0); // PB0 = VSYNC
+static volatile uint8_t hline_counter = 0;
+static volatile uint8_t vline_counter = 0;
+static volatile uint16_t pixel_index = 0;
 
-  // Timer1: HSYNC generator
-  TCCR1A = 0;
-  TCCR1B = _BV(WGM12) | _BV(CS10); // CTC, no prescale
-  OCR1A = 1016; // ~15.7kHz for HSYNC
-  TIMSK1 = _BV(OCIE1A); // Enable interrupt
+// Framebuffer scanline pointer and bit offset for output
+static volatile uint16_t scanline_fb_offset = 0;
+static volatile uint8_t scanline_bit_offset = 0;
 
-  // Timer2: Pixel clock (fast PWM for output)
-  TCCR2A = _BV(COM2B1) | _BV(WGM21) | _BV(WGM20); // Fast PWM
-  TCCR2B = _BV(CS20); // No prescale
-  OCR2B = 0;
-
-  sei(); // Enable interrupts
-}
-
-void VGAX::end() {
-  // Stop interrupts and timers
-  TIMSK1 = 0;
-  TCCR1A = TCCR1B = 0;
-  TCCR2A = TCCR2B = 0;
+void VGAX_RGB3::begin(bool enableTone) {
   cli();
+
+  // Setup RGB pins as outputs, initial low
+  DDRD |= (1 << PIN_BLUE) | (1 << PIN_RED) | (1 << PIN_GREEN);
+  PORTD &= ~((1 << PIN_BLUE) | (1 << PIN_RED) | (1 << PIN_GREEN));
+
+  // Clear framebuffer
+  VGAX_RGB3::clear(COLOR_BLACK);
+
+  // Timer0 - horizontal line timer, ~31.5kHz (VGA pixel clock ~25.175 MHz / 4 cycles per pixel approx)
+  // Using CTC mode with OCR0A = 63 at 16 MHz clock for ~31.5 kHz interrupt rate
+  TCCR0A = (1 << WGM01);
+  TCCR0B = (1 << CS00); // No prescaling
+  OCR0A = 63;
+  TIMSK0 |= (1 << OCIE0A);
+
+  // Timer1 - vertical sync timer, 60 Hz
+  TCCR1A = 0;
+  TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC, prescaler 64
+  OCR1A = 26666; // 16MHz/(64*26666) ~ 60Hz
+  TIMSK1 |= (1 << OCIE1A);
+
+  // Setup tone timer (Timer2) if enabled
+  if (enableTone) {
+    TCCR2A = 0;
+    TCCR2B = 0;
+    TIMSK2 = 0;
+  }
+
+  sei();
 }
 
-// Clear framebuffer with a 3-bit color
-void VGAX::clear(byte color) {
-  color &= 0b00000111;
-  for (int i = 0; i < VGAX_SIZE; i++) {
-    vgaxfb[i] = color;
+void VGAX_RGB3::end() {
+  cli();
+  TIMSK0 = 0;
+  TIMSK1 = 0;
+  TIMSK2 = 0;
+  sei();
+}
+
+void VGAX_RGB3::clear(uint8_t color) {
+  // Fill framebuffer with repeated color (3 bits per pixel packed)
+  uint32_t pattern = 0;
+  for (int i = 0; i < 8; i++) {
+    pattern <<= 3;
+    pattern |= (color & 0x07);
+  }
+  uint8_t p0 = (pattern >> 16) & 0xFF;
+  uint8_t p1 = (pattern >> 8) & 0xFF;
+  uint8_t p2 = pattern & 0xFF;
+
+  for (int y = 0; y < VGAX_HEIGHT; y++) {
+    for (int b = 0; b < VGAX_BWIDTH; b += 3) {
+      vgaxfb[y * VGAX_BWIDTH + b] = p0;
+      vgaxfb[y * VGAX_BWIDTH + b + 1] = p1;
+      vgaxfb[y * VGAX_BWIDTH + b + 2] = p2;
+    }
   }
 }
 
-// Generate a tone on a pin (dummy placeholder)
-void VGAX::tone(unsigned int frequency) {
-  // Optional: implement a simple square wave on a timer pin
-}
+void VGAX_RGB3::putpixel(uint8_t x, uint8_t y, uint8_t color) {
+  if (x >= VGAX_WIDTH || y >= VGAX_HEIGHT) return;
 
-// Stop tone
-void VGAX::noTone() {
-  // Optional
-}
+  uint16_t bitpos = y * VGAX_WIDTH * 3 + x * 3;
+  uint16_t bytepos = bitpos >> 3;
+  uint8_t bit_in_byte = bitpos & 7;
 
-// --- Interrupt Service Routine ---
+  uint8_t val = color & 0x07;
 
-// X scan line (0 to VGAX_HEIGHT-1)
-volatile byte scanline = 0;
+  uint8_t b0 = vgaxfb[bytepos];
+  uint8_t b1 = (bytepos + 1 < VGAX_BSIZE) ? vgaxfb[bytepos + 1] : 0;
 
-ISR(TIMER1_COMPA_vect) {
-  // VSYNC pulse
-  if (scanline == 0) {
-    PORTB &= ~_BV(0); // VSYNC LOW
-  } else if (scanline == 2) {
-    PORTB |= _BV(0); // VSYNC HIGH
+  if (bit_in_byte <= 5) {
+    uint8_t mask = 0x07 << (5 - bit_in_byte);
+    b0 = (b0 & ~mask) | (val << (5 - bit_in_byte));
+  } else {
+    uint8_t first_bits = 8 - bit_in_byte;
+    uint8_t second_bits = 3 - first_bits;
+
+    uint8_t mask0 = ((1 << first_bits) - 1);
+    uint8_t mask1 = ((1 << second_bits) - 1) << (8 - second_bits);
+
+    b0 = (b0 & ~mask0) | ((val >> second_bits) & mask0);
+    b1 = (b1 & ~mask1) | ((val << (8 - second_bits)) & mask1);
   }
 
-  // HSYNC pulse
-  PORTD &= ~_BV(7); // HSYNC LOW
-  delayMicroseconds(4); // Short pulse
-  PORTD |= _BV(7); // HSYNC HIGH
+  vgaxfb[bytepos] = b0;
+  if (bytepos + 1 < VGAX_BSIZE) vgaxfb[bytepos + 1] = b1;
+}
 
-  // If visible scanline
-  if (scanline < VGAX_HEIGHT) {
-    for (int x = 0; x < VGAX_WIDTH; x++) {
-      byte color = vgaxfb[scanline * VGAX_WIDTH + x] & 0b00000111;
+uint8_t VGAX_RGB3::getpixel(uint8_t x, uint8_t y) {
+  if (x >= VGAX_WIDTH || y >= VGAX_HEIGHT) return 0;
 
-      // Send RGB bits (PD6=R, PD5=G, PD3=B)
-      PORTD = (PORTD & ~(_BV(6) | _BV(5) | _BV(3))) |
-              ((color & 0b001) << 3) |   // B -> PD3
-              ((color & 0b010) << 4) |   // G -> PD5
-              ((color & 0b100) << 3);    // R -> PD6
-      delayMicroseconds(1); // Basic pixel clock
+  uint16_t bitpos = y * VGAX_WIDTH * 3 + x * 3;
+  uint16_t bytepos = bitpos >> 3;
+  uint8_t bit_in_byte = bitpos & 7;
+
+  uint8_t b0 = vgaxfb[bytepos];
+  uint8_t b1 = (bytepos + 1 < VGAX_BSIZE) ? vgaxfb[bytepos + 1] : 0;
+
+  if (bit_in_byte <= 5) {
+    uint8_t mask = 0x07 << (5 - bit_in_byte);
+    return (b0 & mask) >> (5 - bit_in_byte);
+  } else {
+    uint8_t first_bits = 8 - bit_in_byte;
+    uint8_t second_bits = 3 - first_bits;
+
+    uint8_t mask0 = ((1 << first_bits) - 1);
+    uint8_t mask1 = ((1 << second_bits) - 1) << (8 - second_bits);
+
+    uint8_t val0 = b0 & mask0;
+    uint8_t val1 = (b1 & mask1) >> (8 - second_bits);
+
+    return (val0 << second_bits) | val1;
+  }
+}
+
+void VGAX_RGB3::delay(int msec) {
+  unsigned long start = millis();
+  while ((millis() - start) < (unsigned long)msec);
+}
+
+unsigned long VGAX_RGB3::millis() {
+  return vtimer * 16;
+}
+
+// Tone generation on D3 (Timer2)
+void VGAX_RGB3::tone(unsigned int frequency) {
+  if (frequency == 0) {
+    VGAX_RGB3::noTone();
+    return;
+  }
+
+  uint32_t ocr = (16000000UL / (2UL * 8UL * frequency)) - 1;
+  if (ocr > 255) ocr = 255;
+
+  tone_divider = (uint16_t)ocr;
+
+  DDRD |= (1 << 3);
+  tone_pin_mask = (1 << 3);
+
+  TCCR2A = (1 << WGM21);
+  TCCR2B = (1 << CS11);
+  OCR2A = tone_divider;
+  TIMSK2 |= (1 << OCIE2A);
+}
+
+void VGAX_RGB3::noTone() {
+  TIMSK2 &= ~(1 << OCIE2A);
+  tone_pin_mask = 0;
+  DDRD &= ~(1 << 3);
+  PORTD &= ~(1 << 3);
+}
+
+// Timer2 Compare Match ISR for tone generation
+ISR(TIMER2_COMPA_vect) {
+  if (tone_pin_mask) {
+    PORTD ^= tone_pin_mask;
+  }
+}
+
+// --- VGA output ISR ---
+
+// Timer0 Compare Match Interrupt - horizontal line timing and pixel output
+ISR(TIMER0_COMPA_vect) {
+  static uint8_t hcount = 0;
+
+  if (vline_counter < VGAX_HEIGHT) {
+    // Output one horizontal scanline pixel data (120 pixels)
+
+    // We output 120 pixels * 3 bits = 360 bits per line
+    // We need to output 3 bits at a time to pins PD5,6,7 (Blue, Red, Green)
+
+    // We output 1 pixel per interrupt call for simplicity (you can speed this up by unrolling)
+
+    // Calculate bit position in framebuffer
+    uint32_t bit_pos = vline_counter * VGAX_WIDTH * 3 + hcount * 3;
+    uint16_t byte_pos = bit_pos >> 3;
+    uint8_t bit_offset = bit_pos & 7;
+
+    // Read 3 bits for pixel
+    uint8_t b0 = vgaxfb[byte_pos];
+    uint8_t b1 = (byte_pos + 1 < VGAX_BSIZE) ? vgaxfb[byte_pos + 1] : 0;
+    uint8_t pixel_val;
+
+    if (bit_offset <= 5) {
+      pixel_val = (b0 >> (5 - bit_offset)) & 0x07;
+    } else {
+      uint8_t first_bits = 8 - bit_offset;
+      uint8_t second_bits = 3 - first_bits;
+      pixel_val = ((b0 & ((1 << first_bits) - 1)) << second_bits) |
+                  ((b1 >> (8 - second_bits)) & ((1 << second_bits) - 1));
     }
 
-    // Clear RGB outputs after scan
-    PORTD &= ~(_BV(6) | _BV(5) | _BV(3));
+    // Output pixel color bits to PORTD pins 5,6,7
+    // Bit0=Blue(PD5), Bit1=Red(PD6), Bit2=Green(PD7)
+    uint8_t port_mask = ((pixel_val & 0x01) << PIN_BLUE) |
+                        ((pixel_val & 0x02) << (PIN_RED - 1)) |
+                        ((pixel_val & 0x04) << (PIN_GREEN - 2));
+
+    // Clear pins PD5,6,7
+    PORTD &= ~((1 << PIN_BLUE) | (1 << PIN_RED) | (1 << PIN_GREEN));
+    // Set pins according to pixel_val
+    PORTD |= port_mask;
+
+    hcount++;
+  } else {
+    // Horizontal blanking interval - set all RGB pins low
+    PORTD &= ~((1 << PIN_BLUE) | (1 << PIN_RED) | (1 << PIN_GREEN));
   }
 
-  // Advance scanline
-  scanline++;
-  if (scanline >= VGAX_HEIGHT + 45) { // total lines incl. vblank
-    scanline = 0;
-    vtimer++; // 1 frame = 1 tick
+  hcount++;
+
+  if (hcount >= (VGAX_WIDTH + 40)) {
+    // After 120 pixels + ~40 blank pixels, reset hcount, increment vline_counter
+    hcount = 0;
+    vline_counter++;
+  }
+
+  if (vline_counter >= 525) {
+    vline_counter = 0;
   }
 }
+
+// Timer1 Compare Match Interrupt - vertical sync (mocked)
+ISR(TIMER1_COMPA_vect) {
+  vtimer++;
+}
+
